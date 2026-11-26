@@ -6,7 +6,7 @@ import { getModelClient, model } from "./model.ts";
 export type { ChatMessage } from "../shared/chat.ts";
 
 type ModelClient = ReturnType<typeof getModelClient>;
-type Action = "add" | "list" | "due" | "done" | "delete" | "chat";
+type Action = "add" | "list" | "due" | "done" | "delete" | "clarify" | "chat";
 type Priority = "high" | "mid" | "low";
 
 interface Task {
@@ -22,9 +22,16 @@ interface TaskMeta {
 
 type MetaMap = Record<string, TaskMeta>;
 
+interface TaskSpec {
+  title: string;
+  priority?: Priority;
+  dueDate?: string;
+}
+
 interface Intent {
   action: Action;
   title?: string;
+  tasks?: TaskSpec[];
   taskId?: string | null;
   priority?: Priority;
   dueDate?: string;
@@ -86,12 +93,40 @@ const ACTION_ALIASES: Record<string, Action> = {
   due: "due", expire: "due", expires: "due", deadline: "due", due_today: "due",
   done: "done", complete: "done", finish: "done", mark: "done", mark_done: "done",
   delete: "delete", remove: "delete", del: "delete", cancel: "delete",
+  clarify: "clarify", ask: "clarify", question: "clarify", unclear: "clarify",
   chat: "chat", talk: "chat", other: "chat",
 };
 
 function normalizeAction(value: unknown): Action | null {
   const key = String(value ?? "").toLowerCase().trim();
   return ACTION_ALIASES[key] ?? null;
+}
+
+function parsePriority(value: unknown): Priority | undefined {
+  return value === "high" || value === "mid" || value === "low" ? value : undefined;
+}
+
+function parseDueDate(value: unknown): string | undefined {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : undefined;
+}
+
+function parseTasks(value: unknown): TaskSpec[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const specs = value
+    .map((item): TaskSpec | null => {
+      if (typeof item === "string") return { title: item };
+      if (item && typeof item === "object") {
+        const o = item as Record<string, unknown>;
+        return {
+          title: typeof o.title === "string" ? o.title : "",
+          priority: parsePriority(o.priority),
+          dueDate: parseDueDate(o.dueDate),
+        };
+      }
+      return null;
+    })
+    .filter((t): t is TaskSpec => t !== null && t.title.trim().length > 0);
+  return specs.length > 0 ? specs : undefined;
 }
 
 function parseIntent(raw: string): Intent | null {
@@ -102,20 +137,13 @@ function parseIntent(raw: string): Intent | null {
     const obj = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
     const action = normalizeAction(obj.action);
     if (!action) return null;
-    const priority =
-      obj.priority === "high" || obj.priority === "mid" || obj.priority === "low"
-        ? (obj.priority as Priority)
-        : undefined;
-    const dueDate =
-      typeof obj.dueDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(obj.dueDate)
-        ? obj.dueDate
-        : undefined;
     return {
       action,
       title: typeof obj.title === "string" ? obj.title : undefined,
+      tasks: parseTasks(obj.tasks),
       taskId: typeof obj.taskId === "string" ? obj.taskId : null,
-      priority,
-      dueDate,
+      priority: parsePriority(obj.priority),
+      dueDate: parseDueDate(obj.dueDate),
       message: typeof obj.message === "string" ? obj.message : undefined,
     };
   } catch {
@@ -161,17 +189,18 @@ function formatList(tasks: Task[], meta: MetaMap): string {
   return `你现在有 ${tasks.length} 条任务（待办 ${open.length} 条 / 已完成 ${done.length} 条）：\n${lines.join("\n")}${dueHint}`;
 }
 
-function guessTargetByText(text: string, tasks: Task[]): Task | undefined {
-  let best: { task: Task; score: number } | undefined;
-  for (const task of tasks) {
-    const chars = new Set(task.title.replace(/\s/g, ""));
-    if (chars.size === 0) continue;
-    let hit = 0;
-    for (const ch of chars) if (text.includes(ch)) hit++;
-    const score = hit / chars.size;
-    if (!best || score > best.score) best = { task, score };
-  }
-  return best && best.score >= 0.6 ? best.task : undefined;
+function guessTargets(text: string, tasks: Task[]): Task[] {
+  return tasks
+    .map((task) => {
+      const chars = new Set(task.title.replace(/\s/g, ""));
+      if (chars.size === 0) return { task, score: 0 };
+      let hit = 0;
+      for (const ch of chars) if (text.includes(ch)) hit++;
+      return { task, score: hit / chars.size };
+    })
+    .filter((s) => s.score >= 0.6)
+    .sort((a, b) => b.score - a.score)
+    .map((s) => s.task);
 }
 
 function findTask(tasks: Task[], intent: Intent, userText: string): Task | undefined {
@@ -184,7 +213,7 @@ function findTask(tasks: Task[], intent: Intent, userText: string): Task | undef
     const direct = tasks.find((t) => t.title.includes(key) || key.includes(t.title));
     if (direct) return direct;
   }
-  return guessTargetByText(userText, tasks);
+  return guessTargets(userText, tasks)[0];
 }
 
 function extractTitle(text: string): string | undefined {
@@ -204,22 +233,24 @@ function buildSystem(tasks: Task[], meta: MetaMap): string {
 今天是 ${today}（${weekday}），据此推算「今天、明天、周五」等相对日期。
 
 json 字段：
-- action: "add" | "list" | "due" | "done" | "delete" | "chat" 六选一，必须使用这几个值
-- title: add 时的任务标题，去掉「帮我记一下」「记一条」等前缀，1-200 字；其他动作可省略
+- action: "add" | "list" | "due" | "done" | "delete" | "clarify" | "chat" 七选一，必须使用这几个值
+- tasks: add 时输出任务数组，每项为 {"title":"...", "priority":"high|mid|low 可省略", "dueDate":"YYYY-MM-DD 可省略"}。
+  一句话含多个独立动作时必须拆成多条：如「做饭洗碗买东西逛超市运动」→ 拆成「做饭」「洗碗」「买东西」「逛超市」「运动」五条。
+  「其中运动比较紧急」→ 只给「运动」设 priority:"high"，其他不设。
+  单条任务也用数组，只有一个元素。
 - taskId: done/delete 时，从下面的任务列表里选出最匹配的一条的 id；匹配不到填 null
-- priority: add 时，用户说「紧急/重要/尽快」→ "high"；说「不急/有空再说」→ "low"；没提就省略
-- dueDate: add 时，用户提到期限（今天/明天/后天/周X/X月X日）→ 换算为 "YYYY-MM-DD"；没提就省略
 - message: 自然简短的中文回复，20 字以内
 
 当前任务列表 json（含已知的优先级 priority 和截止日期 due）：
 ${JSON.stringify(enriched)}
 
 判断规则：
-- 「记一下」「加上」「新增」→ add，并尽量抽取 priority 和 dueDate
+- 新增任务 → add，多个动作拆成多条，逐条设置 priority 和 dueDate
 - 「有哪些任务」「看看清单」→ list
 - 「今天有哪些任务到期」「什么快到期了」→ due
-- 「买好了」「取完了」「做完了」→ done，按语义匹配（如「牛奶买好了」对应「买牛奶」）
+- 「买好了」「取完了」「做完了」→ done，只标记用户提到的那一件事，不要波及其他任务
 - 「删掉」「去掉」「取消」→ delete
+- 内容空洞、无法确定要做什么（如「记一下那个事」「帮我记个东西」没有具体内容）→ clarify，在 message 里追问细节，如「你想记的具体是什么任务？」
 - 其他闲聊 → chat，在 message 里正常回答
 - 只根据最新一句判断，不要被历史对话误导`;
 }
@@ -293,22 +324,46 @@ export async function reply(messages: ChatMessage[]): Promise<string> {
 
     switch (intent.action) {
       case "add": {
-        const title = (intent.title ?? extractTitle(userText) ?? userText).trim().slice(0, 200);
-        if (!title) return "任务内容不能为空。";
-        const duplicate = tasks.find((t) => !t.done && t.title === title);
-        if (duplicate) return `「${title}」已经在清单里了，不用重复记。`;
-        const created = await api<Task>("/api/tasks", {
-          method: "POST",
-          body: JSON.stringify({ title }),
-        });
-        const taskMeta: TaskMeta = {};
-        if (intent.dueDate) taskMeta.due = intent.dueDate;
-        if (intent.priority) taskMeta.priority = intent.priority;
-        if (Object.keys(taskMeta).length > 0) {
-          meta[created.id] = taskMeta;
-          saveMeta(meta);
+        const specs: TaskSpec[] = intent.tasks?.length
+          ? intent.tasks
+          : [{
+              title: intent.title ?? extractTitle(userText) ?? userText,
+              priority: intent.priority,
+              dueDate: intent.dueDate,
+            }];
+
+        const created: string[] = [];
+        const duplicates: string[] = [];
+        for (const spec of specs) {
+          const title = spec.title.trim().slice(0, 200);
+          if (!title) continue;
+          if (tasks.some((t) => !t.done && t.title === title)) {
+            duplicates.push(title);
+            continue;
+          }
+          const res = await api<Task>("/api/tasks", {
+            method: "POST",
+            body: JSON.stringify({ title }),
+          });
+          const m: TaskMeta = {};
+          if (spec.dueDate) m.due = spec.dueDate;
+          if (spec.priority) m.priority = spec.priority;
+          if (Object.keys(m).length > 0) {
+            meta[res.id] = m;
+            saveMeta(meta);
+          }
+          created.push(title);
         }
-        return intent.message || `已添加「${title}」${describeMeta(taskMeta)}。`;
+
+        if (created.length === 0 && duplicates.length === 0) {
+          return "没听清要记什么，可以说得具体一点吗？比如「帮我记一下买牛奶」。";
+        }
+        const lines: string[] = [];
+        if (created.length === 1) lines.push(`已添加「${created[0]}」。`);
+        else if (created.length > 1)
+          lines.push(`已记下 ${created.length} 件事：${created.map((t) => `「${t}」`).join("、")}。`);
+        if (duplicates.length) lines.push(`「${duplicates.join("」「")}」已在清单，未重复添加。`);
+        return lines.join("\n");
       }
       case "list":
         return formatList(await listTasks(), meta);
@@ -323,6 +378,12 @@ export async function reply(messages: ChatMessage[]): Promise<string> {
       }
       case "done":
       case "delete": {
+        if (!intent.taskId && !intent.title) {
+          const candidates = guessTargets(userText, tasks);
+          if (candidates.length >= 2) {
+            return `你说的是哪一条？现在有：${candidates.map((t) => `「${t.title}」`).join("、")}。说清楚了我再处理。`;
+          }
+        }
         const target = findTask(tasks, intent, userText);
         if (!target) return "没找到对应的任务，可以说得更明确些，比如「把买牛奶标记为完成」。";
         if (intent.action === "done") {
@@ -339,6 +400,8 @@ export async function reply(messages: ChatMessage[]): Promise<string> {
         }
         return intent.message || `已删除「${target.title}」。`;
       }
+      case "clarify":
+        return intent.message || "你想记的具体是什么事？再说详细一点，我好帮你记下。";
       case "chat":
         return intent.message || "我是小明，可以帮你管理待办清单。";
     }
